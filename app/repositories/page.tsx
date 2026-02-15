@@ -4,9 +4,9 @@ import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Sidebar from '@/components/Sidebar'
 import { getCurrentUser, canIngestRepos, getPostAuthRedirectTarget } from '@/lib/auth'
-import { getRepositories, addRepository, markRepositoryAsIngested } from '@/lib/repositories'
+import { getRepositories } from '@/lib/repositories'
 import { supabase } from '@/lib/supabase'
-import { Repository, User } from '@/types'
+import { RepoProvider, Repository, User } from '@/types'
 import { Plus, GitBranch, CheckCircle2, Clock, Loader2 } from 'lucide-react'
 
 export default function RepositoriesPage() {
@@ -15,8 +15,11 @@ export default function RepositoriesPage() {
   const [repositories, setRepositories] = useState<Repository[]>([])
   const [isIngesting, setIsIngesting] = useState<string | null>(null)
   const [showAddForm, setShowAddForm] = useState(false)
+  const [provider, setProvider] = useState<RepoProvider>('github')
   const [newRepoName, setNewRepoName] = useState('')
   const [newRepoUrl, setNewRepoUrl] = useState('')
+  const [newProductId, setNewProductId] = useState('')
+  const [error, setError] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
 
   useEffect(() => {
@@ -40,7 +43,8 @@ export default function RepositoriesPage() {
         }
 
         setUser(currentUser)
-        setRepositories(getRepositories(currentUser.currentOrganizationId))
+        const repos = await getRepositories(currentUser.currentOrganizationId)
+        setRepositories(repos)
       } catch (error) {
         console.error('Error loading user:', error)
         router.replace('/login')
@@ -52,7 +56,9 @@ export default function RepositoriesPage() {
   }, [router])
 
   const handleIngest = async (repoId: string) => {
+    if (!user?.currentOrganizationId) return
     setIsIngesting(repoId)
+    setError(null)
     try {
       const { data: authData } = await supabase.auth.getSession()
       const accessToken = authData.session?.access_token
@@ -71,23 +77,60 @@ export default function RepositoriesPage() {
       const data = await response.json()
       
       if (data.success) {
-        markRepositoryAsIngested(repoId)
-        setRepositories(getRepositories(user!.currentOrganizationId!))
+        const repos = await getRepositories(user.currentOrganizationId)
+        setRepositories(repos)
+      } else {
+        setError(data.message || 'Failed to ingest repository')
       }
     } catch (error) {
       console.error('Ingestion failed:', error)
+      setError('Ingestion failed')
     } finally {
       setIsIngesting(null)
     }
   }
 
-  const handleAddRepository = () => {
-    if (!newRepoName.trim() || !newRepoUrl.trim() || !user) return
-    
-    addRepository(newRepoName, newRepoUrl, user.currentOrganizationId!)
-    setRepositories(getRepositories(user.currentOrganizationId!))
+  const handleAddRepository = async () => {
+    if (!newRepoName.trim() || !newRepoUrl.trim() || !newProductId.trim() || !user?.currentOrganizationId) return
+    setError(null)
+
+    try {
+      const { data: authData } = await supabase.auth.getSession()
+      const accessToken = authData.session?.access_token
+
+      const response = await fetch('/api/repositories', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+        },
+        body: JSON.stringify({
+          provider,
+          serviceName: newRepoName.trim(),
+          repoUrl: newRepoUrl.trim(),
+          productId: newProductId.trim(),
+          organizationId: user.currentOrganizationId,
+        }),
+      })
+
+      const data = await response.json()
+      if (!data.success) {
+        setError(data.message || 'Failed to add repository')
+        return
+      }
+
+      const repos = await getRepositories(user.currentOrganizationId)
+      setRepositories(repos)
+    } catch (e) {
+      console.error('Add repository failed:', e)
+      setError('Failed to add repository')
+      return
+    }
+
     setNewRepoName('')
     setNewRepoUrl('')
+    setNewProductId('')
+    setProvider('github')
     setShowAddForm(false)
   }
 
@@ -127,10 +170,25 @@ export default function RepositoriesPage() {
             </button>
           </div>
 
+          {error && (
+            <div className="mb-4 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+              {error}
+            </div>
+          )}
+
           {showAddForm && (
             <div className="mb-6 p-4 bg-[#0f0f0f] border border-[#1f1f1f] rounded-lg">
               <h3 className="text-sm font-medium text-white mb-4">Add New Repository</h3>
               <div className="space-y-3">
+                <select
+                  value={provider}
+                  onChange={(e) => setProvider(e.target.value as RepoProvider)}
+                  className="w-full bg-[#1a1a1a] border border-[#1f1f1f] rounded-lg px-4 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-[#6366f1]"
+                >
+                  <option value="github">GitHub</option>
+                  <option value="gitlab">GitLab</option>
+                  <option value="bitbucket">Bitbucket</option>
+                </select>
                 <input
                   type="text"
                   placeholder="Service Name"
@@ -145,6 +203,13 @@ export default function RepositoriesPage() {
                   onChange={(e) => setNewRepoUrl(e.target.value)}
                   className="w-full bg-[#1a1a1a] border border-[#1f1f1f] rounded-lg px-4 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#6366f1]"
                 />
+                <input
+                  type="text"
+                  placeholder="Product ID"
+                  value={newProductId}
+                  onChange={(e) => setNewProductId(e.target.value)}
+                  className="w-full bg-[#1a1a1a] border border-[#1f1f1f] rounded-lg px-4 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#6366f1]"
+                />
                 <div className="flex gap-2">
                   <button
                     onClick={handleAddRepository}
@@ -157,6 +222,7 @@ export default function RepositoriesPage() {
                       setShowAddForm(false)
                       setNewRepoName('')
                       setNewRepoUrl('')
+                      setNewProductId('')
                     }}
                     className="flex-1 bg-[#1a1a1a] border border-[#1f1f1f] text-white rounded-lg px-4 py-2 hover:bg-[#1f1f1f] transition-colors"
                   >

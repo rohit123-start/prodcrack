@@ -35,7 +35,8 @@ export default function DashboardPage() {
         }
         
         setUser(currentUser)
-        setRepositories(getRepositories(currentUser.currentOrganizationId))
+        const repos = await getRepositories(currentUser.currentOrganizationId)
+        setRepositories(repos)
       } catch (error) {
         console.error('Error loading user:', error)
         router.replace('/login')

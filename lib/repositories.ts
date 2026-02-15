@@ -1,56 +1,58 @@
-import { Repository } from '@/types'
+import { RepoProvider, Repository } from '@/types'
+import { supabase } from './supabase'
 
-// Simulated repository storage
-// In production, this would be stored in a database
-let repositories: Repository[] = [
-  {
-    id: 'repo_1',
-    serviceName: 'User Service',
-    repoUrl: 'https://github.com/org/user-service',
-    organizationId: 'org_1',
-    isIngested: false,
-    createdAt: new Date().toISOString(),
-  },
-  {
-    id: 'repo_2',
-    serviceName: 'Payment Service',
-    repoUrl: 'https://github.com/org/payment-service',
-    organizationId: 'org_1',
-    isIngested: true,
-    ingestedAt: new Date(Date.now() - 86400000).toISOString(),
-    createdAt: new Date(Date.now() - 172800000).toISOString(),
-  },
-]
-
-export function getRepositories(organizationId: string): Repository[] {
-  return repositories.filter(repo => repo.organizationId === organizationId)
+function mapRepositoryRow(row: any): Repository {
+  return {
+    id: row.id,
+    provider: row.provider,
+    serviceName: row.service_name,
+    repoUrl: row.repo_url,
+    productId: row.product_id,
+    organizationId: row.organization_id,
+    status: row.status,
+    isIngested: row.is_ingested,
+    ingestedAt: row.ingested_at || undefined,
+    createdAt: row.created_at,
+  }
 }
 
-export function getRepositoryById(repositoryId: string): Repository | null {
-  return repositories.find((repo) => repo.id === repositoryId) || null
+export async function getRepositories(organizationId: string): Promise<Repository[]> {
+  const { data, error } = await supabase
+    .from('repositories')
+    .select('*')
+    .eq('organization_id', organizationId)
+    .order('created_at', { ascending: false })
+
+  if (error) {
+    console.error('Error loading repositories:', error)
+    return []
+  }
+  return (data || []).map(mapRepositoryRow)
 }
 
-export function addRepository(
-  serviceName: string,
-  repoUrl: string,
+export async function addRepository(input: {
+  provider: RepoProvider
+  serviceName: string
+  repoUrl: string
+  productId: string
   organizationId: string
-): Repository {
-  const newRepo: Repository = {
-    id: `repo_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-    serviceName,
-    repoUrl,
-    organizationId,
-    isIngested: false,
-    createdAt: new Date().toISOString(),
-  }
-  repositories.push(newRepo)
-  return newRepo
-}
+}): Promise<{ repository: Repository | null; error: any }> {
+  const { data, error } = await supabase
+    .from('repositories')
+    .insert({
+      provider: input.provider,
+      service_name: input.serviceName,
+      repo_url: input.repoUrl,
+      product_id: input.productId,
+      organization_id: input.organizationId,
+      status: 'not_ingested',
+      is_ingested: false,
+    })
+    .select('*')
+    .single()
 
-export function markRepositoryAsIngested(repositoryId: string): void {
-  const repo = repositories.find(r => r.id === repositoryId)
-  if (repo) {
-    repo.isIngested = true
-    repo.ingestedAt = new Date().toISOString()
+  if (error || !data) {
+    return { repository: null, error: error || new Error('Insert failed') }
   }
+  return { repository: mapRepositoryRow(data), error: null }
 }

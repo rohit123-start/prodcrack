@@ -36,7 +36,7 @@ export default function InsightsPage() {
         }
 
         setUser(currentUser)
-        const repos = getRepositories(currentUser.currentOrganizationId)
+        const repos = await getRepositories(currentUser.currentOrganizationId)
         setRepositories(repos)
         // Auto-select first ingested repo if available
         const ingestedRepo = repos.find(r => r.isIngested)

@@ -1,4 +1,6 @@
 export type OrgMemberRole = 'admin' | 'member' | 'viewer'
+export type RepoProvider = 'github' | 'gitlab' | 'bitbucket'
+export type RepoStatus = 'not_ingested' | 'ingesting' | 'ingested' | 'failed'
 
 export interface User {
   id: string
@@ -17,15 +19,26 @@ export interface Organization {
 
 export interface Repository {
   id: string
+  provider: RepoProvider
   serviceName: string
   repoUrl: string
+  productId: string
   organizationId: string
+  status: RepoStatus
   isIngested: boolean
   ingestedAt?: string
   createdAt: string
 }
 
-export type ContextBlockType = 'flow' | 'permissions' | 'billing' | 'feature'
+export type ContextBlockType =
+  | 'feature'
+  | 'architecture'
+  | 'user_flow'
+  | 'integration'
+  | 'business_logic'
+  | 'flow'
+  | 'permissions'
+  | 'billing'
 
 export interface ProductContextBlock {
   id: string
