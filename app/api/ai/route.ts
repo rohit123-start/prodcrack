@@ -3,6 +3,9 @@ import { getSupabaseAdmin, getUserFromBearerToken } from '@/lib/server/supabase-
 import { answerWithContext, interpretQuestion } from '@/lib/agents/chat-interpreter-agent'
 import { AIResponse } from '@/types'
 
+const FALLBACK_ANSWER =
+  'Based on available context, this appears to be temporarily unavailable. Please try again shortly.'
+
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
@@ -10,7 +13,7 @@ export async function POST(request: NextRequest) {
 
     if (!question || typeof question !== 'string') {
       return NextResponse.json(
-        { error: 'Question is required' },
+        { answer: FALLBACK_ANSWER, confidence: 0.3, contextBlocksUsed: [], error: 'Question is required' },
         { status: 400 }
       )
     }
@@ -21,12 +24,18 @@ export async function POST(request: NextRequest) {
       : null
 
     if (!accessToken) {
-      return NextResponse.json({ error: 'Missing access token' }, { status: 401 })
+      return NextResponse.json(
+        { answer: FALLBACK_ANSWER, confidence: 0.3, contextBlocksUsed: [], error: 'Missing access token' },
+        { status: 401 }
+      )
     }
 
     const authUser = await getUserFromBearerToken(accessToken)
     if (!authUser) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+      return NextResponse.json(
+        { answer: FALLBACK_ANSWER, confidence: 0.3, contextBlocksUsed: [], error: 'Unauthorized' },
+        { status: 401 }
+      )
     }
 
     const supabase = getSupabaseAdmin()
@@ -38,7 +47,10 @@ export async function POST(request: NextRequest) {
 
     const orgIds = (memberships || []).map((m) => m.organization_id)
     if (orgIds.length === 0) {
-      return NextResponse.json({ error: 'No organization access' }, { status: 403 })
+      return NextResponse.json(
+        { answer: FALLBACK_ANSWER, confidence: 0.3, contextBlocksUsed: [], error: 'No organization access' },
+        { status: 403 }
+      )
     }
 
     const { data: repos } = await supabase
@@ -57,7 +69,10 @@ export async function POST(request: NextRequest) {
 
     const scopedRepoIds = repositoryId ? repoIds.filter((id) => id === repositoryId) : repoIds
     if (scopedRepoIds.length === 0) {
-      return NextResponse.json({ error: 'Repository not accessible' }, { status: 403 })
+      return NextResponse.json(
+        { answer: FALLBACK_ANSWER, confidence: 0.3, contextBlocksUsed: [], error: 'Repository not accessible' },
+        { status: 403 }
+      )
     }
 
     const interpreted = await interpretQuestion(question)
@@ -74,7 +89,10 @@ export async function POST(request: NextRequest) {
 
     const { data: keywordBlocks, error: blocksError } = await blocksQuery
     if (blocksError) {
-      return NextResponse.json({ error: 'Failed to load context' }, { status: 500 })
+      return NextResponse.json(
+        { answer: FALLBACK_ANSWER, confidence: 0.3, contextBlocksUsed: [], error: 'Failed to load context' },
+        { status: 500 }
+      )
     }
 
     let contextBlocks = keywordBlocks || []
@@ -103,7 +121,7 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     console.error('AI API error:', error)
     return NextResponse.json(
-      { error: 'Failed to process question' },
+      { answer: FALLBACK_ANSWER, confidence: 0.3, contextBlocksUsed: [], error: 'Failed to process question' },
       { status: 500 }
     )
   }

@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect } from 'react'
 import { Send, Loader2 } from 'lucide-react'
 import { ChatMessage } from '@/types'
+import { supabase } from '@/lib/supabase'
 
 interface ChatInterfaceProps {
   repositoryId?: string
@@ -38,9 +39,15 @@ export default function ChatInterface({ repositoryId }: ChatInterfaceProps) {
     setIsLoading(true)
 
     try {
-      const response = await fetch('/api/ai', {
+      const { data: authData } = await supabase.auth.getSession()
+      const accessToken = authData.session?.access_token
+
+      const response = await fetch('/api/ask', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+        },
         body: JSON.stringify({
           question: input,
           repositoryId,
@@ -48,11 +55,19 @@ export default function ChatInterface({ repositoryId }: ChatInterfaceProps) {
       })
 
       const data = await response.json()
+      const fallbackMessage =
+        'I could not process your request right now. Based on available context, this appears to need a retry. Please try again in a moment.'
+
+      if (!response.ok) {
+        throw new Error(data?.error || data?.message || 'AI request failed')
+      }
 
       const assistantMessage: ChatMessage = {
         id: `msg_${Date.now()}_assistant`,
         role: 'assistant',
-        content: data.answer,
+        content: typeof data.answer === 'string' && data.answer.trim().length > 0
+          ? data.answer
+          : fallbackMessage,
         confidence: data.confidence,
         timestamp: new Date(),
       }
@@ -63,7 +78,10 @@ export default function ChatInterface({ repositoryId }: ChatInterfaceProps) {
       const errorMessage: ChatMessage = {
         id: `msg_${Date.now()}_error`,
         role: 'assistant',
-        content: 'Sorry, I encountered an error. Please try again.',
+        content:
+          error instanceof Error && error.message.toLowerCase().includes('authorization fail')
+            ? 'authorization fail'
+            : 'I could not process your request right now. Based on available context, this appears to need a retry.',
         timestamp: new Date(),
       }
       setMessages(prev => [...prev, errorMessage])
