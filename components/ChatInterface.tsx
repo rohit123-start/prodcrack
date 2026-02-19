@@ -15,6 +15,19 @@ export default function ChatInterface({ repositoryId }: ChatInterfaceProps) {
   const [isLoading, setIsLoading] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
+  const getSessionId = () => {
+    if (typeof window === 'undefined') return `session_${repositoryId || 'global'}`
+    const key = `productgpt:chat_session:${repositoryId || 'global'}`
+    const existing = window.localStorage.getItem(key)
+    if (existing) return existing
+    const generated =
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `session_${Date.now()}`
+    window.localStorage.setItem(key, generated)
+    return generated
+  }
+
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }
@@ -41,6 +54,13 @@ export default function ChatInterface({ repositoryId }: ChatInterfaceProps) {
     try {
       const { data: authData } = await supabase.auth.getSession()
       const accessToken = authData.session?.access_token
+      const sessionId = getSessionId()
+      const chatHistory = [...messages, userMessage]
+        .slice(-8)
+        .map((message) => ({
+          role: message.role,
+          content: message.content,
+        }))
 
       const response = await fetch('/api/ask', {
         method: 'POST',
@@ -51,6 +71,8 @@ export default function ChatInterface({ repositoryId }: ChatInterfaceProps) {
         body: JSON.stringify({
           question: input,
           repositoryId,
+          sessionId,
+          chatHistory,
         }),
       })
 

@@ -55,7 +55,7 @@ export default function RepositoriesPage() {
     loadUser()
   }, [router])
 
-  const handleIngest = async (repoId: string) => {
+  const handleIngest = async (repoId: string, forceReingest = false) => {
     if (!user?.currentOrganizationId) return
     setIsIngesting(repoId)
     setError(null)
@@ -72,6 +72,7 @@ export default function RepositoriesPage() {
         body: JSON.stringify({
           repositoryId: repoId,
           organizationId: user?.currentOrganizationId,
+          forceReingest,
         }),
       })
       const data = await response.json()
@@ -278,9 +279,9 @@ export default function RepositoriesPage() {
                       )}
                     </div>
                     <div className="ml-4">
-                      {!repo.isIngested && canIngest && (
+                      {canIngest && (
                         <button
-                          onClick={() => handleIngest(repo.id)}
+                          onClick={() => handleIngest(repo.id, repo.isIngested)}
                           disabled={isIngesting === repo.id}
                           className="bg-[#6366f1] text-white rounded-lg px-4 py-2 hover:bg-[#5856eb] disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
                         >
@@ -290,11 +291,11 @@ export default function RepositoriesPage() {
                               Ingesting...
                             </>
                           ) : (
-                            'Ingest Repo'
+                            repo.isIngested ? 'Re-run Ingestion' : 'Ingest Repo'
                           )}
                         </button>
                       )}
-                      {!canIngest && !repo.isIngested && (
+                      {!canIngest && (
                         <p className="text-xs text-gray-500 text-right">
                           Admin/PM required
                         </p>

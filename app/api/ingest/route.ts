@@ -1,14 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getSupabaseAdmin, getUserFromBearerToken } from '@/lib/server/supabase-admin'
-import { runIngestionAgent } from '@/lib/agents/ingestion-agent'
-import { LLMRequestError } from '@/lib/llm/openai'
+import { runGenosIngestion } from '../../../lib/agents/genos-ingestion'
 
 function isRepoStatusEnumError(message?: string) {
   return Boolean(message && message.includes('enum repo_status'))
-}
-
-function isContextTypeEnumError(message?: string) {
-  return Boolean(message && message.includes('enum context_type'))
 }
 
 async function updateRepositoryStatusWithFallback(
@@ -35,43 +30,26 @@ async function updateRepositoryStatusWithFallback(
   return lastError
 }
 
-function mapBlocksToLegacyTypes(
-  blocks: Array<{
-    repository_id: string
-    type: string
-    title: string
-    description: string
-    content: string
-    keywords: string[]
-  }>
-) {
-  const typeMap: Record<string, string> = {
-    architecture: 'feature',
-    user_flow: 'flow',
-    integration: 'feature',
-    business_logic: 'feature',
-  }
-  return blocks.map((block) => ({
-    ...block,
-    type: typeMap[block.type] || block.type,
-  }))
-}
-
 export async function GET() {
   return NextResponse.json({
     ok: true,
-    message: 'Use POST /api/ingest with repositoryId and organizationId to start ingestion.',
+    message: 'Use POST /api/ingest with organizationId and repositoryId or repository_url to start ingestion.',
   })
 }
 
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    const { repositoryId, organizationId } = body
+    const {
+      repositoryId: repositoryIdInput,
+      repository_url: repositoryUrlInput,
+      organizationId,
+      forceReingest,
+    } = body
 
-    if (!repositoryId || !organizationId) {
+    if ((!repositoryIdInput && !repositoryUrlInput) || !organizationId) {
       return NextResponse.json(
-        { success: false, message: 'Repository ID and organization ID are required' },
+        { success: false, message: 'organizationId and repositoryId or repository_url are required' },
         { status: 400 }
       )
     }
@@ -97,12 +75,18 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const { data: repository, error: repositoryError } = await supabase
+    let repositoryQuery = supabase
       .from('repositories')
       .select('*')
-      .eq('id', repositoryId)
       .eq('organization_id', organizationId)
-      .maybeSingle()
+
+    if (repositoryIdInput) {
+      repositoryQuery = repositoryQuery.eq('id', repositoryIdInput)
+    } else {
+      repositoryQuery = repositoryQuery.eq('repo_url', repositoryUrlInput)
+    }
+
+    const { data: repository, error: repositoryError } = await repositoryQuery.maybeSingle()
 
     if (repositoryError || !repository) {
       return NextResponse.json(
@@ -111,9 +95,13 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    if (repository.is_ingested) {
+    const repositoryId = repository.id
+
+    const isForceReingest = Boolean(forceReingest)
+
+    if (repository.is_ingested && !isForceReingest) {
       return NextResponse.json(
-        { success: false, message: 'Repository already ingested' },
+        { success: false, message: 'Repository already ingested. Use re-run ingestion to refresh.' },
         { status: 409 }
       )
     }
@@ -132,12 +120,43 @@ export async function POST(request: NextRequest) {
       )
     }
 
+    async function safeDeleteByRepositoryId(table: string) {
+      const { error } = await supabase
+        .from(table as any)
+        .delete()
+        .eq('repository_id', repositoryId)
+      if (!error) return
+      const message = error.message?.toLowerCase?.() || ''
+      if (message.includes('does not exist') || message.includes('relation')) {
+        return
+      }
+      throw new Error(`${table} cleanup failed: ${error.message}`)
+    }
+
+    // Re-run ingestion should refresh structure index for updated repository snapshots.
+    if (isForceReingest) {
+      try {
+        await safeDeleteByRepositoryId('repository_entities')
+        await safeDeleteByRepositoryId('code_graph')
+        await safeDeleteByRepositoryId('chat_session_memory')
+        await safeDeleteByRepositoryId('embeddings')
+        await safeDeleteByRepositoryId('embeddings')
+      } catch (cleanupError) {
+        console.error('Failed to cleanup repository artifacts for re-ingestion:', cleanupError)
+        return NextResponse.json(
+          { success: false, message: 'Failed to prepare repository for re-ingestion' },
+          { status: 500 }
+        )
+      }
+    }
+
     // Mark processing to support future async workers.
     const processingError = await updateRepositoryStatusWithFallback(
       supabase,
       repositoryId,
       organizationId,
-      ['ingesting', 'processing']
+      ['ingesting', 'processing'],
+      { is_ingested: false, ingested_at: null }
     )
 
     if (processingError) {
@@ -148,13 +167,11 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    let ingestion
+    let ingestionResult
     try {
-      // STEP A+B: provider fetch + agentic extraction into product intelligence blocks.
-      ingestion = await runIngestionAgent({
-        provider: repository.provider,
-        repoUrl: repository.repo_url,
-        serviceName: repository.service_name,
+      ingestionResult = await runGenosIngestion({
+        repositoryId,
+        repositoryUrl: repository.repo_url,
       })
     } catch (error) {
       await supabase
@@ -163,74 +180,8 @@ export async function POST(request: NextRequest) {
         .eq('id', repositoryId)
         .eq('organization_id', organizationId)
 
-      if (error instanceof LLMRequestError && error.kind === 'authorization_fail') {
-        return NextResponse.json(
-          { success: false, message: 'authorization fail' },
-          { status: 500 }
-        )
-      }
-
       return NextResponse.json(
-        { success: false, message: 'data not ingested' },
-        { status: 500 }
-      )
-    }
-
-    const contextBlocks = ingestion.blocks
-      .map((block) => ({
-        repository_id: repositoryId,
-        type: block.type,
-        title: block.title,
-        description: block.description,
-        content: block.content,
-        keywords: block.keywords,
-      }))
-      .filter(
-        (block) =>
-          block.repository_id &&
-          block.type &&
-          block.title &&
-          block.description &&
-          block.content &&
-          Array.isArray(block.keywords) &&
-          block.keywords.length > 0
-      )
-
-    if (contextBlocks.length === 0) {
-      await supabase
-        .from('repositories')
-        .update({ status: 'failed' })
-        .eq('id', repositoryId)
-        .eq('organization_id', organizationId)
-
-      return NextResponse.json(
-        { success: false, message: 'data not ingested' },
-        { status: 500 }
-      )
-    }
-
-    // STEP C: insert context blocks.
-    let { error: blocksError } = await supabase
-      .from('product_context_blocks')
-      .insert(contextBlocks)
-
-    // Compatibility fallback for environments with legacy context_type enums.
-    if (blocksError && isContextTypeEnumError(blocksError.message)) {
-      const legacyBlocks = mapBlocksToLegacyTypes(contextBlocks)
-      const retry = await supabase.from('product_context_blocks').insert(legacyBlocks)
-      blocksError = retry.error
-    }
-
-    if (blocksError) {
-      console.error('Context block insert failed:', blocksError)
-      await supabase
-        .from('repositories')
-        .update({ status: 'failed' })
-        .eq('id', repositoryId)
-        .eq('organization_id', organizationId)
-
-      return NextResponse.json(
-        { success: false, message: 'data not ingested' },
+        { success: false, message: 'Ingestion pipeline failed' },
         { status: 500 }
       )
     }
@@ -263,11 +214,11 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({
       success: true,
-      message: 'Repository ingested successfully',
-      contextBlocksCreated: contextBlocks.length,
-      sourceFilesProcessed: ingestion.sourceFileCount,
-      moduleChunksProcessed: ingestion.chunkCount,
-      usedFallbackExtraction: ingestion.usedFallback,
+      message: isForceReingest
+        ? 'Repository re-ingested successfully'
+        : 'Repository ingested successfully',
+      reingested: isForceReingest,
+      ...ingestionResult,
     })
   } catch (error) {
     console.error('Ingestion error:', error)
