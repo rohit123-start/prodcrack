@@ -968,7 +968,6 @@ export async function POST(request: NextRequest) {
     )
 
     const gojoKeywords = normalizeKeywords(gojo.keywords)
-    const fallbackQuestionKeywords = extractKeywordsFromQuestion(refinedQuestion)
     if (gojo.intent_type === 'greeting') {
       const greetingFallback =
         'Hi! Happy to help. Ask me what flows are implemented in your product, and I will explain them in product language.'
@@ -1026,38 +1025,12 @@ export async function POST(request: NextRequest) {
       },
     })
 
-    const weakGojo = isVagueIntent(gojo.intent, gojo.intent_type, gojoKeywords)
-    const finalGojoKeywords = weakGojo
-      ? Array.from(new Set([...gojoKeywords, ...fallbackQuestionKeywords, ...dominantDomains.slice(0, 6)])).slice(0, 16)
-      : (gojoKeywords.length > 0 ? gojoKeywords : fallbackQuestionKeywords)
+    const finalGojoKeywords = gojoKeywords
 
     const memoryEntityIds = await readSessionMemoryEntities({ sessionId, repositoryId })
     const memoryEntities = await retrieveEntitiesByIds(repositoryId, memoryEntityIds)
 
-    const correctedGojo: GojoOutput = weakGojo
-      ? {
-          intent_type: 'repo_question',
-          intent: 'repository_overview',
-          objective: 'explain major application flows',
-          keywords: finalGojoKeywords,
-          answer_style: 'product',
-        }
-      : { ...gojo, keywords: finalGojoKeywords }
-
-    if (weakGojo) {
-      await logger.log({
-        orchestratorState: 'chat_orchestrator',
-        agentName: 'SHIKAMARU',
-        step: 'vague_intent_correction',
-        status: 'success',
-        inputSummary: { original_intent: gojo.intent || 'unknown', original_keywords: gojoKeywords.slice(0, 10) },
-        outputSummary: {
-          correction_triggered: true,
-          corrected_intent: correctedGojo.intent,
-          corrected_keywords: correctedGojo.keywords.slice(0, 12),
-        },
-      })
-    }
+    const correctedGojo: GojoOutput = { ...gojo, keywords: finalGojoKeywords }
     await logger.log({
       orchestratorState: 'chat_orchestrator',
       agentName: 'SHIKAMARU',
@@ -1096,7 +1069,6 @@ export async function POST(request: NextRequest) {
     )
     const anchorTerms = extractAnchorTerms(flowAnchors)
     const retrievalKeywords = buildRetrievalKeywords(
-      refinedQuestion,
       finalGojoKeywords,
       expandedKeywords,
       anchorTerms,
@@ -1213,34 +1185,32 @@ export async function POST(request: NextRequest) {
       outputSummary: { findings_count: sukuna.findings.length, unknowns_count: sukuna.unknowns.length },
     })
 
-    const deterministicFallback = buildDeterministicFallbackAnswer(refinedQuestion, candidateEntities, relationships)
-    const canUseYuji = sukuna.findings.length > 0
-    const yujiAnswerRaw = canUseYuji
-      ? await withTimeout(
-          runOpenAIText(
-            AGENT_PROMPTS.NARUTO,
-            JSON.stringify({
-              question: refinedQuestion,
-              objective: correctedGojo.objective || compactText(refinedQuestion, 120),
-              findings: sukuna.findings,
-              unknowns: sukuna.unknowns,
-              constraints: sukuna.constraints,
-            }),
-            deterministicFallback
-          ),
-          450,
-          deterministicFallback
-        )
-      : deterministicFallback
-    const yujiAnswer = sanitizeProductAnswer(yujiAnswerRaw, deterministicFallback)
+    const narutoFallback =
+      'Based on current indexed context, I cannot confidently describe this behavior yet. Please ask a narrower product-flow question.'
+    const yujiAnswerRaw = await withTimeout(
+      runOpenAIText(
+        AGENT_PROMPTS.NARUTO,
+        JSON.stringify({
+          question: refinedQuestion,
+          objective: correctedGojo.objective || compactText(refinedQuestion, 120),
+          findings: sukuna.findings,
+          unknowns: sukuna.unknowns,
+          constraints: sukuna.constraints,
+        }),
+        narutoFallback
+      ),
+      450,
+      narutoFallback
+    )
+    const yujiAnswer = sanitizeProductAnswer(yujiAnswerRaw, narutoFallback)
 
     await logger.log({
       orchestratorState: 'chat_orchestrator',
       agentName: 'NARUTO',
       step: 'product_translation',
-      status: canUseYuji ? 'success' : 'skipped',
+      status: 'success',
       inputSummary: { findings_count: sukuna.findings.length, unknowns_count: sukuna.unknowns.length },
-      outputSummary: { answer_len: yujiAnswer.length, fallback_used: !canUseYuji },
+      outputSummary: { answer_len: yujiAnswer.length, fallback_used: yujiAnswer === narutoFallback },
     })
 
     // Update session memory for continuity.

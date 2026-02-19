@@ -55,6 +55,7 @@ type RepositoryEntityRow = {
   entity_name: string
   entity_type: string
   file_path: string
+  content: string | null
   metadata: Record<string, unknown>
 }
 
@@ -73,6 +74,19 @@ type GenosResult = {
   graph_nodes_count: number
   embeddings_created_count: number
   ingestion_status: 'structure_indexed' | 'failed'
+  reports: StakeholderReports
+}
+
+type StakeholderSection = {
+  summary: string
+  metrics: Record<string, number>
+  report: string[]
+}
+
+type StakeholderReports = {
+  cto: StakeholderSection
+  pm: StakeholderSection
+  operations: StakeholderSection
 }
 
 function sanitizeRepoUrl(url: string) {
@@ -110,6 +124,194 @@ function toKeywordSet(values: string[]) {
     }
   }
   return Array.from(set).slice(0, 20)
+}
+
+function containsAny(text: string, keywords: string[]) {
+  const lower = text.toLowerCase()
+  return keywords.some((keyword) => lower.includes(keyword))
+}
+
+function isBackendApiPath(pathValue: string) {
+  const lower = pathValue.toLowerCase()
+
+  // Hard excludes — never treat frontend/asset paths as backend API.
+  const excludeHints = [
+    '/components/',
+    '/views/',
+    '/screens/',
+    '/styles/',
+    '/assets/',
+    '/public/',
+    '/frontend/',
+    '/client/',
+  ]
+  if (excludeHints.some((hint) => lower.includes(hint))) return false
+
+  // Repos often have a root-level `api/`, `server/`, or `backend/` folder whose
+  // relative paths start WITHOUT a leading slash (e.g. "api/utils/error.js").
+  // Check for these root-folder prefixes explicitly before the slash-prefixed hints.
+  const rootBackendFolders = ['api/', 'server/', 'backend/']
+  if (rootBackendFolders.some((prefix) => lower.startsWith(prefix))) return true
+
+  // Standard slash-prefixed path hints for nested directories.
+  const includeHints = [
+    '/api/',
+    '/routes/',
+    '/route/',
+    '/controller/',
+    '/controllers/',
+    '/model/',
+    '/models/',
+    '/service/',
+    '/services/',
+    '/middleware/',
+    '/middlewares/',
+    '/schema/',
+    '/schemas/',
+    '/utils/',
+    'pages/api/',
+    'app/api/',
+  ]
+  return includeHints.some((hint) => lower.includes(hint))
+}
+
+function hasServerImport(imports: string[]) {
+  const serverDeps = [
+    'express',
+    'koa',
+    'fastify',
+    'hapi',
+    '@nestjs',
+    'next/server',
+    'next/headers',
+    'mongoose',
+    'sequelize',
+    'typeorm',
+    'prisma',
+    'knex',
+    'jsonwebtoken',
+    'bcrypt',
+    'bcryptjs',
+    'passport',
+    'cookie-parser',
+    'cors',
+    'helmet',
+    'dotenv',
+    'body-parser',
+  ]
+  return imports.some((item) => containsAny(item, serverDeps))
+}
+
+function isApiFlowAnalysis(analysis: AstFileAnalysis) {
+  if (analysis.routes.length > 0) return true
+  if (isBackendApiPath(analysis.path)) return true
+  if (hasServerImport(analysis.imports)) return true
+  return false
+}
+
+
+function extractRouteFromApiEntity(entity: RepositoryEntityRow) {
+  if (entity.entity_type !== 'api') return { method: 'GET', path: '/' }
+  const method = typeof entity.metadata.method === 'string'
+    ? entity.metadata.method.toUpperCase()
+    : entity.entity_name.split(' ')[0]?.toUpperCase() || 'GET'
+  const routePath = typeof entity.metadata.route_path === 'string'
+    ? entity.metadata.route_path
+    : entity.entity_name.split(' ').slice(1).join(' ') || '/'
+  return { method, path: routePath.startsWith('/') ? routePath : `/${routePath}` }
+}
+
+function flowKeyFromPath(routePath: string) {
+  const segments = routePath.split('/').filter(Boolean)
+  return segments[0] || 'root'
+}
+
+function topCounts(values: string[], limit: number) {
+  const freq = new Map<string, number>()
+  for (const value of values) {
+    freq.set(value, (freq.get(value) || 0) + 1)
+  }
+  return Array.from(freq.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+}
+
+function buildStakeholderReports(
+  entities: RepositoryEntityRow[],
+  graph: CodeGraphRow[],
+  framework: FrameworkDetection
+): StakeholderReports {
+  const apiEntities = entities.filter((entity) => entity.entity_type === 'api')
+  const moduleEntities = entities.filter((entity) => entity.entity_type === 'module')
+  const dependencyEntities = entities.filter((entity) => entity.entity_type === 'dependency')
+
+  const routes = apiEntities.map((entity) => extractRouteFromApiEntity(entity))
+  const routeFlowKeys = routes.map((route) => flowKeyFromPath(route.path))
+  const topFlows = topCounts(routeFlowKeys, 6)
+  const writeOps = routes.filter((route) => ['POST', 'PUT', 'PATCH', 'DELETE'].includes(route.method)).length
+  const authFlows = routeFlowKeys.filter((flow) => containsAny(flow, ['auth', 'login', 'session', 'token'])).length
+  const paymentFlows = routeFlowKeys.filter((flow) => containsAny(flow, ['payment', 'billing', 'checkout', 'invoice'])).length
+
+  const serviceModules = moduleEntities.filter((entity) => containsAny(entity.file_path, ['service', 'controller', 'route'])).length
+  const externalDeps = dependencyEntities
+    .map((entity) => entity.entity_name)
+    .filter((name) => !name.startsWith('.'))
+  const uniqueExternalDeps = Array.from(new Set(externalDeps))
+
+  const ctoReport: StakeholderSection = {
+    summary: `Backend API flow index created for ${apiEntities.length} endpoints with ${graph.length} relationships across ${framework.framework || 'unknown'} (${framework.primaryLanguage || 'unknown'}).`,
+    metrics: {
+      api_endpoints: apiEntities.length,
+      api_related_modules: serviceModules,
+      graph_relationships: graph.length,
+      external_integrations: uniqueExternalDeps.length,
+    },
+    report: [
+      `Primary API domains: ${topFlows.slice(0, 4).map(([name]) => name).join(', ') || 'none detected'}.`,
+      `${writeOps} state-changing endpoints identified (POST/PUT/PATCH/DELETE).`,
+      `${uniqueExternalDeps.length} external dependency touchpoints detected in backend API flow.`,
+    ],
+  }
+
+  const pmReport: StakeholderSection = {
+    summary: `Product-facing backend capabilities were inferred from ${apiEntities.length} API endpoints and grouped into dominant operational flows.`,
+    metrics: {
+      api_endpoints: apiEntities.length,
+      dominant_flows: topFlows.length,
+      auth_related_flows: authFlows,
+      payment_related_flows: paymentFlows,
+    },
+    report: [
+      `Top user/business flows: ${topFlows.map(([name, count]) => `${name} (${count})`).join(', ') || 'none detected'}.`,
+      authFlows > 0
+        ? 'Authentication/session lifecycle endpoints are present.'
+        : 'Authentication/session lifecycle endpoints were not strongly detected.',
+      paymentFlows > 0
+        ? 'Payment/billing lifecycle endpoints are present.'
+        : 'Payment/billing lifecycle endpoints were not strongly detected.',
+    ],
+  }
+
+  const opsReport: StakeholderSection = {
+    summary: 'Operations report highlights runtime-sensitive API paths and reliability focus areas.',
+    metrics: {
+      write_operations: writeOps,
+      read_operations: Math.max(0, routes.length - writeOps),
+      monitored_flows: topFlows.length,
+      integration_touchpoints: uniqueExternalDeps.length,
+    },
+    report: [
+      `${writeOps} write-oriented endpoints should be prioritized for retry/idempotency and alerting coverage.`,
+      `Top operational domains to monitor: ${topFlows.slice(0, 5).map(([name]) => name).join(', ') || 'none detected'}.`,
+      `${uniqueExternalDeps.length} integration touchpoints may require failure handling and timeout policies.`,
+    ],
+  }
+
+  return {
+    cto: ctoReport,
+    pm: pmReport,
+    operations: opsReport,
+  }
 }
 
 function isIncludedPath(pathValue: string) {
@@ -283,10 +485,17 @@ function parseWithAst(filePath: string, content: string): AstFileAnalysis {
 function buildEntities(
   repositoryId: string,
   analyses: AstFileAnalysis[],
-  framework: FrameworkDetection
+  framework: FrameworkDetection,
+  fileContentByPath: Map<string, string>
 ): RepositoryEntityRow[] {
   const entities: RepositoryEntityRow[] = []
-  const addEntity = (entityName: string, entityType: string, filePath: string, metadata: Record<string, unknown>) => {
+  const addEntity = (
+    entityName: string,
+    entityType: string,
+    filePath: string,
+    metadata: Record<string, unknown>,
+    content: string | null
+  ) => {
     const id = makeEntityId(repositoryId, entityName, filePath)
     const tags = toKeywordSet([entityName, entityType, filePath, framework.framework, framework.primaryLanguage])
     entities.push({
@@ -295,6 +504,7 @@ function buildEntities(
       entity_name: entityName,
       entity_type: entityType,
       file_path: filePath,
+      content,
       metadata: {
         ...metadata,
         tags,
@@ -306,17 +516,21 @@ function buildEntities(
   }
 
   for (const file of analyses) {
-    addEntity(file.path, 'module', file.path, { parse_error: file.parseError || null, snippet: file.snippet })
-    for (const fn of file.functions) addEntity(fn, 'function', file.path, { snippet: file.snippet })
-    for (const cls of file.classes) addEntity(cls, 'class', file.path, { snippet: file.snippet })
+    // Every file that reached buildEntities already passed isApiFlowAnalysis —
+    // it is confirmed backend API-flow scope, so always store full content on the
+    // module entity and on every API route entity from that file.
+    const fullFileContent = fileContentByPath.get(file.path) ?? null
+    addEntity(file.path, 'module', file.path, { parse_error: file.parseError || null, snippet: file.snippet }, fullFileContent)
+    for (const fn of file.functions) addEntity(fn, 'function', file.path, { snippet: file.snippet }, null)
+    for (const cls of file.classes) addEntity(cls, 'class', file.path, { snippet: file.snippet }, null)
     for (const route of file.routes) {
       addEntity(`${route.method.toUpperCase()} ${route.path}`, 'api', file.path, {
         method: route.method,
         route_path: route.path,
         snippet: file.snippet,
-      })
+      }, fullFileContent)
     }
-    for (const imp of file.imports) addEntity(imp, 'dependency', file.path, { snippet: file.snippet })
+    for (const imp of file.imports) addEntity(imp, 'dependency', file.path, { snippet: file.snippet }, null)
   }
 
   const deduped = new Map<string, RepositoryEntityRow>()
@@ -503,13 +717,18 @@ export async function runGenosIngestion(input: {
       outputSummary: {},
     })
     const analyses = files.map((file) => parseWithAst(file.path, file.content))
+    const apiFlowAnalyses = analyses.filter((analysis) => isApiFlowAnalysis(analysis))
+    const fileContentByPath = new Map<string, string>(files.map((file) => [file.path, file.content]))
     await logger.log({
       orchestratorState: 'ast_parsing_started',
       agentName: 'CHILD_EMPEROR',
       step: 'ast_parsing',
       status: 'success',
       inputSummary: { files_processed: analyses.length },
-      outputSummary: { parse_failures: analyses.filter((a) => a.parseError).length },
+      outputSummary: {
+        parse_failures: analyses.filter((a) => a.parseError).length,
+        api_flow_files: apiFlowAnalyses.length,
+      },
     })
 
     await logger.log({
@@ -517,18 +736,22 @@ export async function runGenosIngestion(input: {
       agentName: 'DRIVE_KNIGHT',
       step: 'entity_extraction',
       status: 'started',
-      inputSummary: { analyses_count: analyses.length },
+      inputSummary: { analyses_count: apiFlowAnalyses.length },
       outputSummary: {},
     })
-    const entities = buildEntities(storageRepositoryId, analyses, framework)
+    const entities = buildEntities(storageRepositoryId, apiFlowAnalyses, framework, fileContentByPath)
     await batchUpsert('repository_entities', entities, 'repository_id,entity_name,file_path')
     await logger.log({
       orchestratorState: 'entities_extracted',
       agentName: 'DRIVE_KNIGHT',
       step: 'entity_extraction',
       status: 'success',
-      inputSummary: { analyses_count: analyses.length },
-      outputSummary: { entities_extracted_count: entities.length },
+      inputSummary: { analyses_count: apiFlowAnalyses.length },
+      outputSummary: {
+        entities_extracted_count: entities.length,
+        entities_with_content: entities.filter((entity) => Boolean(entity.content)).length,
+        entities_null_content: entities.filter((entity) => !entity.content).length,
+      },
     })
 
     await logger.log({
@@ -539,7 +762,7 @@ export async function runGenosIngestion(input: {
       inputSummary: { entities_count: entities.length },
       outputSummary: {},
     })
-    const graph = buildCodeGraph(storageRepositoryId, analyses, entities)
+    const graph = buildCodeGraph(storageRepositoryId, apiFlowAnalyses, entities)
     await writeCodeGraphRows(graph)
     await logger.log({
       orchestratorState: 'graph_built',
@@ -548,6 +771,20 @@ export async function runGenosIngestion(input: {
       status: 'success',
       inputSummary: { entities_count: entities.length },
       outputSummary: { graph_relationships_count: graph.length },
+    })
+
+    const reports = buildStakeholderReports(entities, graph, framework)
+    await logger.log({
+      orchestratorState: 'ingestion_completed',
+      agentName: 'GENOS',
+      step: 'stakeholder_reports_generated',
+      status: 'success',
+      inputSummary: { api_entities: entities.filter((entity) => entity.entity_type === 'api').length },
+      outputSummary: {
+        cto_metrics: reports.cto.metrics,
+        pm_metrics: reports.pm.metrics,
+        operations_metrics: reports.operations.metrics,
+      },
     })
 
     await logger.log({
@@ -570,6 +807,7 @@ export async function runGenosIngestion(input: {
         entities_extracted_count: entities.length,
         graph_nodes_count: graph.length,
         ingestion_status: 'structure_indexed',
+        scope: 'backend_api_flow_only',
       },
     })
 
@@ -580,6 +818,7 @@ export async function runGenosIngestion(input: {
       graph_nodes_count: graph.length,
       embeddings_created_count: 0,
       ingestion_status: 'structure_indexed',
+      reports,
     }
   } catch (error) {
     await logger.log({

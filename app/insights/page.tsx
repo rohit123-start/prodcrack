@@ -6,13 +6,29 @@ import Sidebar from '@/components/Sidebar'
 import ChatInterface from '@/components/ChatInterface'
 import { getCurrentUser, getPostAuthRedirectTarget } from '@/lib/auth'
 import { getRepositories } from '@/lib/repositories'
+import { supabase } from '@/lib/supabase'
 import { Repository, User } from '@/types'
+
+type StakeholderSection = {
+  summary: string
+  metrics: Record<string, number>
+  report: string[]
+}
+
+type StakeholderReports = {
+  cto: StakeholderSection
+  pm: StakeholderSection
+  operations: StakeholderSection
+}
 
 export default function InsightsPage() {
   const router = useRouter()
   const [user, setUser] = useState<User | null>(null)
   const [repositories, setRepositories] = useState<Repository[]>([])
   const [selectedRepoId, setSelectedRepoId] = useState<string | undefined>()
+  const [reportsByRepo, setReportsByRepo] = useState<Record<string, StakeholderReports>>({})
+  const [isGeneratingReport, setIsGeneratingReport] = useState(false)
+  const [reportError, setReportError] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
 
   useEffect(() => {
@@ -69,6 +85,51 @@ export default function InsightsPage() {
   }
 
   const ingestedRepos = repositories.filter(r => r.isIngested)
+  const selectedReports = selectedRepoId ? reportsByRepo[selectedRepoId] : null
+
+  const formatMetricLabel = (key: string) =>
+    key
+      .split('_')
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(' ')
+
+  const sectionTitle: Record<keyof StakeholderReports, string> = {
+    cto: 'CTO Report',
+    pm: 'PM Report',
+    operations: 'Operations Report',
+  }
+
+  const handleGenerateReports = async () => {
+    if (!selectedRepoId) {
+      setReportError('Select a repository to generate reports.')
+      return
+    }
+    setIsGeneratingReport(true)
+    setReportError(null)
+    try {
+      const { data: authData } = await supabase.auth.getSession()
+      const accessToken = authData.session?.access_token
+      const response = await fetch('/api/reports', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+        },
+        body: JSON.stringify({ repositoryId: selectedRepoId }),
+      })
+      const data = await response.json()
+      if (!data.success || !data.reports) {
+        setReportError(data.message || 'Failed to generate reports')
+        return
+      }
+      setReportsByRepo((prev) => ({ ...prev, [selectedRepoId]: data.reports as StakeholderReports }))
+    } catch (error) {
+      console.error('Generate reports failed:', error)
+      setReportError('Failed to generate reports')
+    } finally {
+      setIsGeneratingReport(false)
+    }
+  }
 
   return (
     <div className="flex h-screen bg-[#0a0a0a]">
@@ -95,9 +156,54 @@ export default function InsightsPage() {
                     </option>
                   ))}
                 </select>
+                <button
+                  onClick={handleGenerateReports}
+                  disabled={isGeneratingReport || !selectedRepoId}
+                  className="bg-[#6366f1] text-white rounded-lg px-3 py-1.5 text-sm hover:bg-[#5856eb] disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  {isGeneratingReport ? 'Generating...' : 'Generate Reports'}
+                </button>
               </div>
             )}
           </div>
+          {reportError && (
+            <div className="mt-3 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+              {reportError}
+            </div>
+          )}
+          {selectedRepoId && selectedReports && (
+            <div className="mt-4 grid gap-4 md:grid-cols-3">
+              {(Object.keys(selectedReports) as Array<keyof StakeholderReports>).map((key) => {
+                const section = selectedReports[key]
+                return (
+                  <div key={key} className="rounded-lg border border-[#1f1f1f] bg-[#121212] p-4">
+                    <h3 className="text-sm font-semibold text-white mb-2">{sectionTitle[key]}</h3>
+                    <p className="text-xs text-gray-300 mb-3">{section.summary}</p>
+                    <div className="space-y-1 mb-3">
+                      {Object.entries(section.metrics).map(([metric, value]) => (
+                        <div key={metric} className="flex items-center justify-between text-xs">
+                          <span className="text-gray-400">{formatMetricLabel(metric)}</span>
+                          <span className="text-white font-medium">{value}</span>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="space-y-1">
+                      {section.report.map((line, index) => (
+                        <p key={`${key}_${index}`} className="text-xs text-gray-300">
+                          {line}
+                        </p>
+                      ))}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+          {selectedRepoId && !selectedReports && (
+            <p className="mt-3 text-xs text-gray-500">
+              Generate reports to view CTO, PM, and Operations summaries from ingested API flow data.
+            </p>
+          )}
         </div>
         <div className="flex-1">
           {ingestedRepos.length === 0 ? (
